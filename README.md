@@ -1,7 +1,5 @@
 # HB Relationship Review Studio — Mockups Based on V1
 
-This package uses the uploaded V1 calculation and export logic as the base, while redesigning the front-end flow.
-
 ## What is included
 
 - **Homepage**
