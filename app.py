@@ -614,7 +614,7 @@ def get_loan(group, loan_id):
 
 def field_chip(source):
     cls = "db-chip" if source == "db" else "manual-chip"
-    label = "COGNOS / Database" if source == "db" else "Manual Input"
+    label = "Database" if source == "db" else "Manual Input"
     st.markdown(f'<div class="source-chip {cls}">{label}</div>', unsafe_allow_html=True)
 
 
@@ -644,7 +644,7 @@ def render_common_sections(group):
 
     with left:
         with st.container(border=True):
-            st.markdown("#### Relationship-Level COGNOS Data")
+            st.markdown("#### Relationship-Level Fixed Data")
             cols = st.columns(2)
             for idx, (key, label) in enumerate(COMMON_COGNOS_FIELDS):
                 value = group["common_db"][key]
@@ -716,7 +716,7 @@ def render_loan_overview_block(loan):
     left, right = st.columns(2)
     with left:
         with st.container(border=True):
-            st.markdown("###### COGNOS Fields")
+            st.markdown("###### Fixed Data Fields")
             cols = st.columns(2)
             for idx, (key, label) in enumerate(LOAN_COGNOS_FIELDS[:12]):
                 value = db[key]
@@ -1547,7 +1547,7 @@ def open_loan_details_dialog(loan):
     if hasattr(st, "dialog"):
         @st.dialog(f"{loan['loan_id']} · Full Loan Details")
         def _loan_dialog():
-            st.markdown("### Additional COGNOS Fields")
+            st.markdown("### Additional Fixed Data Fields")
             rows = []
             shown = {"borrower_name", "loan_number", "loan_type", "loan_balance", "loan_maturity_date", "current_risk_rating", "watch_reason", "collateral_type"}
             for key, label in LOAN_COGNOS_FIELDS:
@@ -1567,7 +1567,7 @@ def open_loan_details_dialog(loan):
 
 def render_mock_two(group):
     st.markdown("## Mock 2 · Consolidated Loan Table")
-    st.caption("Important COGNOS columns stay locked. Important manual inputs stay in the table. Additional data can be opened per loan.")
+    st.caption("Important fixed data columns stay locked. Important manual inputs stay in the table. Additional data can be opened per loan.")
     records = []
     for loan in group["loans"]:
         records.append({
