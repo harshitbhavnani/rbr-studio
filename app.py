@@ -1,9 +1,10 @@
 
 import copy
 import html
+import json
 import re
 import tempfile
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -46,6 +47,8 @@ from export_helpers import (
 st.set_page_config(page_title="HB Relationship Review Studio", layout="wide")
 
 APP_TITLE = "HB Relationship Review Studio"
+APP_DIR = Path(__file__).resolve().parent
+DATA_ARCHIVE_DIR = APP_DIR / "archives" / "data_snapshots"
 DB_BG = "#EAF2FF"
 MANUAL_BG = "#FFF6E8"
 DB_BORDER = "#8CB4FF"
@@ -120,6 +123,100 @@ def pct(x):
         return str(x)
 
 
+def format_db_value(key, value):
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return ", ".join(f"{k}: {v}" for k, v in value.items())
+    if isinstance(value, float) and ("rate" in key or "ltv" in key):
+        return f"{value*100:.2f}%" if value < 1 else money(value)
+    if (
+        isinstance(value, (int, float, np.integer, np.floating))
+        and "date" not in key
+        and "number" not in key
+        and "notes" not in key
+        and "type" not in key
+        and "location" not in key
+        and "reason" not in key
+        and "name" not in key
+        and "recourse" not in key
+    ):
+        return money(value)
+    return value
+
+
+def json_safe(value):
+    if isinstance(value, pd.DataFrame):
+        return [json_safe(row) for row in value.to_dict(orient="records")]
+    if isinstance(value, dict):
+        return {str(k): json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(v) for v in value]
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, (np.integer, np.floating)):
+        return value.item()
+    if isinstance(value, float) and pd.isna(value):
+        return None
+    return value
+
+
+def archive_relationship_version(group, relationship_exec_summary):
+    DATA_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    archived_at = datetime.now()
+    group_id = group["summary"]["group_id"]
+    timestamp = archived_at.strftime("%Y-%m-%d_%H%M%S")
+    path = DATA_ARCHIVE_DIR / f"{group_id}_rbr_version_{timestamp}.json"
+    payload = {
+        "archived_at": archived_at.isoformat(timespec="seconds"),
+        "archive_date": archived_at.strftime("%Y-%m-%d"),
+        "group_id": group_id,
+        "group_name": group["summary"]["group_name"],
+        "relationship_exec_summary": relationship_exec_summary,
+        "group": json_safe(group),
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return path
+
+
+def read_archive_payload(path):
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def restore_group_from_archive_payload(payload):
+    group = copy.deepcopy(payload.get("group", {}))
+    for loan in group.get("loans", []):
+        if isinstance(loan.get("rent_roll"), list):
+            loan["rent_roll"] = pd.DataFrame(loan["rent_roll"])
+    return group
+
+
+def restore_portfolio_from_archive_payload(payload):
+    portfolio = copy.deepcopy(payload.get("portfolio", {}))
+    for group in portfolio.values():
+        for loan in group.get("loans", []):
+            if isinstance(loan.get("rent_roll"), list):
+                loan["rent_roll"] = pd.DataFrame(loan["rent_roll"])
+    return portfolio
+
+
+def archive_metadata(path):
+    path = Path(path)
+    try:
+        payload = read_archive_payload(path)
+    except Exception:
+        payload = {}
+    return {
+        "path": path,
+        "name": path.name,
+        "group_id": payload.get("group_id", "Portfolio"),
+        "group_name": payload.get("group_name", "Archived portfolio snapshot"),
+        "archive_date": payload.get("archive_date", ""),
+        "archived_at": payload.get("archived_at", datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds")),
+        "size_kb": round(path.stat().st_size / 1024, 1),
+    }
+
+
 def markdownish_to_plain_text(text: str) -> str:
     if not text:
         return ""
@@ -179,7 +276,11 @@ def render_commentary_preview(title: str, text: str):
     st.markdown(commentary_to_html(text), unsafe_allow_html=True)
 
 
-def render_editable_commentary_block(label: str, storage: dict, field: str, key_prefix: str, preview_title: str, height: int = 220):
+def is_archive_view():
+    return bool(st.session_state.get("opened_archive_label"))
+
+
+def render_editable_commentary_block(label: str, storage: dict, field: str, key_prefix: str, preview_title: str, height: int = 220, read_only: bool = False):
     edit_key = f"{key_prefix}_{field}_editing"
     draft_key = f"{key_prefix}_{field}_draft"
 
@@ -190,6 +291,11 @@ def render_editable_commentary_block(label: str, storage: dict, field: str, key_
 
     current_value = storage.get(field, "")
 
+    if read_only:
+        st.session_state[edit_key] = False
+        render_commentary_preview(preview_title, current_value)
+        return
+
     if st.session_state[edit_key]:
         st.session_state[draft_key] = st.text_area(
             label,
@@ -198,17 +304,17 @@ def render_editable_commentary_block(label: str, storage: dict, field: str, key_
             key=f"{key_prefix}_{field}_editor",
         )
         c1, c2 = st.columns([1, 1])
-        if c1.button("Save", key=f"{key_prefix}_{field}_save", use_container_width=True):
+        if c1.button("Save", key=f"{key_prefix}_{field}_save", width="stretch"):
             storage[field] = st.session_state[draft_key]
             st.session_state[edit_key] = False
             st.rerun()
-        if c2.button("Cancel", key=f"{key_prefix}_{field}_cancel", use_container_width=True):
+        if c2.button("Cancel", key=f"{key_prefix}_{field}_cancel", width="stretch"):
             st.session_state[draft_key] = current_value
             st.session_state[edit_key] = False
             st.rerun()
     else:
         render_commentary_preview(preview_title, current_value)
-        if st.button(f"Edit {label}", key=f"{key_prefix}_{field}_edit", use_container_width=True):
+        if st.button(f"Edit {label}", key=f"{key_prefix}_{field}_edit", width="stretch"):
             st.session_state[draft_key] = current_value
             st.session_state[edit_key] = True
             st.rerun()
@@ -602,6 +708,9 @@ def get_group():
     gid = st.session_state.get("selected_group_id")
     if not gid:
         return None
+    archived_group = st.session_state.get("archive_view_group")
+    if is_archive_view() and archived_group and archived_group.get("summary", {}).get("group_id") == gid:
+        return archived_group
     return st.session_state.portfolio[gid]
 
 
@@ -623,184 +732,239 @@ def render_db_value(label, value, key):
     st.text_input(label, value=str(value), disabled=True, key=key)
 
 
+def build_relationship_snapshot(group):
+    summary = group["summary"]
+    loans = group["loans"]
+    balances = [float(loan["db"].get("loan_balance", 0) or 0) for loan in loans]
+    note_rates = [float(loan["db"].get("note_rate", 0) or 0) for loan in loans]
+    total_balance = sum(balances)
+    loan_wair = float(np.average(note_rates, weights=balances)) if total_balance else 0.0
+    next_maturity = min(loans, key=lambda loan: loan["db"]["loan_maturity_date"])
+    largest_loan = max(loans, key=lambda loan: loan["db"].get("loan_balance", 0))
+
+    watch_loans = []
+    for loan in loans:
+        rating = str(loan["db"].get("current_risk_rating", "")).strip()
+        reason = str(loan["db"].get("watch_reason", "")).strip()
+        has_watch_reason = reason and reason.lower() not in {"none", "nan"}
+        if rating in {"Watch", "Special Mention", "Substandard"} or has_watch_reason:
+            watch_loans.append((loan["loan_id"], rating, reason if has_watch_reason else rating))
+
+    return {
+        "status": summary["current_rbr_status"],
+        "tier": summary["tier"],
+        "branch": summary["branch"],
+        "officer": summary["officer"],
+        "loan_wair": loan_wair,
+        "next_maturity": next_maturity,
+        "largest_loan": largest_loan,
+        "watch_loans": watch_loans,
+    }
+
+
 def render_group_header(group):
     summary = group["summary"]
+    snapshot = build_relationship_snapshot(group)
     st.title(f"{summary['group_id']} · {summary['group_name']}")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Loan Count", summary["active_loan_account"])
-    c2.metric("Loan Balances", money(summary["loan_balances"]))
-    c3.metric("Commitments", money(summary["loan_commitments"]))
-    c4.metric("Deposit Balances", money(summary["deposit_balances"]))
-    c5, c6, c7, c8 = st.columns(4)
-    c5.metric("Branch", summary["branch"])
-    c6.metric("Officer", summary["officer"])
-    c7.metric("Last Review", fmt_date(summary["last_review_date"]))
-    c8.metric("Next Review", fmt_date(summary["next_review_date"]))
+    with st.container(border=True):
+        st.markdown("### Relationship Snapshot")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("RBR Status", snapshot["status"])
+        c2.metric("Tier", snapshot["tier"])
+        c3.metric("Branch", snapshot["branch"])
+        c4.metric("Officer", snapshot["officer"])
+
+        c5, c6, c7, c8 = st.columns(4)
+        c5.metric("Loan Balances", money(summary["loan_balances"]))
+        c6.metric("Commitments", money(summary["loan_commitments"]))
+        c7.metric("Deposit Balances", money(summary["deposit_balances"]))
+        c8.metric("Loan WAIR", f"{snapshot['loan_wair']*100:.2f}%")
+
+        c9, c10, c11, c12 = st.columns(4)
+        c9.metric("Loan Count", summary["active_loan_account"])
+        c10.metric("Next Maturity", fmt_date(snapshot["next_maturity"]["db"]["loan_maturity_date"]))
+        c11.metric("Largest Loan", money(snapshot["largest_loan"]["db"]["loan_balance"]))
+        c12.metric("Last Review", fmt_date(summary["last_review_date"]))
+
+        if snapshot["watch_loans"]:
+            watch_items = "; ".join(f"{loan_id}: {reason}" for loan_id, _rating, reason in snapshot["watch_loans"])
+        else:
+            watch_items = "None"
+        st.markdown(f"**Watch Items:** {watch_items}")
 
 
 def render_common_sections(group):
+    read_only = is_archive_view()
     st.markdown("### Relationship Information")
-    left, right = st.columns(2)
 
-    with left:
-        with st.container(border=True):
-            st.markdown("#### Relationship-Level Fixed Data")
-            cols = st.columns(2)
-            for idx, (key, label) in enumerate(COMMON_COGNOS_FIELDS):
-                value = group["common_db"][key]
-                if isinstance(value, dict):
-                    value = ", ".join(f"{k}: {v}" for k, v in value.items())
-                with cols[idx % 2]:
-                    render_db_value(label, value, key=f"{group['summary']['group_id']}_common_{key}")
+    with st.container(border=True):
+        st.markdown("#### Relationship-Level Database Data")
+        cols = st.columns(3)
+        for idx, (key, label) in enumerate(COMMON_COGNOS_FIELDS):
+            value = format_db_value(key, group["common_db"][key])
+            with cols[idx % 3]:
+                render_db_value(label, value, key=f"{group['summary']['group_id']}_common_{key}")
 
-    with right:
-        manual = group["common_manual"]
-        with st.container(border=True):
-            st.markdown("#### Relationship-Level Manual Inputs")
+    manual = group["common_manual"]
+    with st.container(border=True):
+        st.markdown("#### Relationship-Level Manual Inputs")
+        c1, c2, c3 = st.columns(3)
+        with c1:
             field_chip("manual")
             manual["relationship_scope"] = st.selectbox(
                 "Relationship Scope", SCOPE_OPTIONS,
                 index=SCOPE_OPTIONS.index(manual["relationship_scope"]),
                 key=f"{group['summary']['group_id']}_relationship_scope",
+                disabled=read_only,
             )
+            field_chip("manual")
+            manual["future_deposit_potential"] = st.selectbox(
+                "Future Deposit Potential",
+                POTENTIAL_OPTIONS,
+                index=POTENTIAL_OPTIONS.index(manual["future_deposit_potential"]),
+                key=f"{group['summary']['group_id']}_future_dep",
+                disabled=read_only,
+            )
+        with c2:
             field_chip("manual")
             manual["key_personnel"] = st.text_input(
                 "Key Personnel",
                 value=manual["key_personnel"],
                 key=f"{group['summary']['group_id']}_key_personnel",
+                disabled=read_only,
             )
-            c1, c2 = st.columns(2)
-            with c1:
-                field_chip("manual")
-                manual["future_deposit_potential"] = st.selectbox(
-                    "Future Deposit Potential",
-                    POTENTIAL_OPTIONS,
-                    index=POTENTIAL_OPTIONS.index(manual["future_deposit_potential"]),
-                    key=f"{group['summary']['group_id']}_future_dep",
-                )
-                field_chip("manual")
-                manual["future_property_acquisition"] = st.selectbox(
-                    "Future Property Acquisition",
-                    POTENTIAL_OPTIONS,
-                    index=POTENTIAL_OPTIONS.index(manual["future_property_acquisition"]),
-                    key=f"{group['summary']['group_id']}_future_prop",
-                )
-            with c2:
-                field_chip("manual")
-                manual["future_borrowing_potential"] = st.selectbox(
-                    "Future Borrowing Potential",
-                    POTENTIAL_OPTIONS,
-                    index=POTENTIAL_OPTIONS.index(manual["future_borrowing_potential"]),
-                    key=f"{group['summary']['group_id']}_future_borr",
-                )
-                field_chip("manual")
-                manual["recent_update"] = st.selectbox(
-                    "Recent Update",
-                    UPDATE_OPTIONS,
-                    index=UPDATE_OPTIONS.index(manual["recent_update"]),
-                    key=f"{group['summary']['group_id']}_recent_update",
-                )
             field_chip("manual")
-            manual["overall_update"] = st.selectbox(
-                "Overall Update",
-                UPDATE_OPTIONS,
-                index=UPDATE_OPTIONS.index(manual["overall_update"]),
-                key=f"{group['summary']['group_id']}_overall_update",
+            manual["future_property_acquisition"] = st.selectbox(
+                "Future Property Acquisition",
+                POTENTIAL_OPTIONS,
+                index=POTENTIAL_OPTIONS.index(manual["future_property_acquisition"]),
+                key=f"{group['summary']['group_id']}_future_prop",
+                disabled=read_only,
             )
+        with c3:
+            field_chip("manual")
+            manual["future_borrowing_potential"] = st.selectbox(
+                "Future Borrowing Potential",
+                POTENTIAL_OPTIONS,
+                index=POTENTIAL_OPTIONS.index(manual["future_borrowing_potential"]),
+                key=f"{group['summary']['group_id']}_future_borr",
+                disabled=read_only,
+            )
+            field_chip("manual")
+            manual["recent_update"] = st.selectbox(
+                "Recent Update",
+                UPDATE_OPTIONS,
+                index=UPDATE_OPTIONS.index(manual["recent_update"]),
+                key=f"{group['summary']['group_id']}_recent_update",
+                disabled=read_only,
+            )
+        field_chip("manual")
+        manual["overall_update"] = st.selectbox(
+            "Overall Update",
+            UPDATE_OPTIONS,
+            index=UPDATE_OPTIONS.index(manual["overall_update"]),
+            key=f"{group['summary']['group_id']}_overall_update",
+            disabled=read_only,
+        )
 
 
 def render_loan_overview_block(loan):
+    read_only = is_archive_view()
     db = loan["db"]
     manual = loan["manual"]
     st.markdown("##### Loan Overview")
-    left, right = st.columns(2)
-    with left:
-        with st.container(border=True):
-            st.markdown("###### Fixed Data Fields")
-            cols = st.columns(2)
-            for idx, (key, label) in enumerate(LOAN_COGNOS_FIELDS[:12]):
-                value = db[key]
-                if isinstance(value, date):
-                    value = value.isoformat()
-                elif isinstance(value, float) and ("rate" in key or "ltv" in key):
-                    value = f"{value*100:.2f}%" if value < 1 and ("rate" in key or "ltv" in key) else money(value)
-                elif isinstance(value, (int, float)) and "date" not in key and "number" not in key and "notes" not in key and "type" not in key and "location" not in key and "reason" not in key and "name" not in key and "recourse" not in key:
-                    value = money(value)
-                with cols[idx % 2]:
-                    render_db_value(label, value, key=f"{loan['loan_id']}_overview_{key}")
-    with right:
-        with st.container(border=True):
-            st.markdown("###### Manual Fields")
-            c1, c2 = st.columns(2)
-            with c1:
-                field_chip("manual")
-                manual["loan_rate_type"] = st.selectbox(
-                    "Loan Rate Type", RATE_TYPES,
-                    index=RATE_TYPES.index(manual["loan_rate_type"]),
-                    key=f"{loan['loan_id']}_rate_type",
-                )
-                field_chip("manual")
-                manual["loan_term_years"] = st.number_input(
-                    "Loan Term (Years)", min_value=1, max_value=30,
-                    value=int(manual["loan_term_years"]),
-                    key=f"{loan['loan_id']}_loan_term_years",
-                )
-                field_chip("manual")
-                manual["strength_bucket"] = st.selectbox(
-                    "Primary Strength", ["Collateral Quality", "Guarantor Support", "Deposit Depth", "Cash Flow Stability", "Market Position"],
-                    index=["Collateral Quality", "Guarantor Support", "Deposit Depth", "Cash Flow Stability", "Market Position"].index(manual["strength_bucket"]),
-                    key=f"{loan['loan_id']}_strength_bucket",
-                )
-                field_chip("manual")
-                manual["relationship_risk_assessment"] = st.selectbox(
-                    "Relationship Risk Assessment",
-                    ["Low", "Moderate", "Elevated"],
-                    index=["Low", "Moderate", "Elevated"].index(manual["relationship_risk_assessment"]),
-                    key=f"{loan['loan_id']}_relationship_risk",
-                )
-            with c2:
-                field_chip("manual")
-                manual["weakness_bucket"] = st.selectbox(
-                    "Primary Weakness", ["Tenant Rollover", "Leverage", "Liquidity", "Construction Timing", "Concentration"],
-                    index=["Tenant Rollover", "Leverage", "Liquidity", "Construction Timing", "Concentration"].index(manual["weakness_bucket"]),
-                    key=f"{loan['loan_id']}_weakness_bucket",
-                )
-                field_chip("manual")
-                manual["risk_rating_recommendation"] = st.selectbox(
-                    "Risk Rating Recommendation",
-                    RISK_RATINGS,
-                    index=RISK_RATINGS.index(manual["risk_rating_recommendation"]),
-                    key=f"{loan['loan_id']}_risk_reco",
-                )
-                field_chip("manual")
-                manual["covenant_review_status"] = st.selectbox(
-                    "Covenant Review", COVENANT_OPTIONS,
-                    index=COVENANT_OPTIONS.index(manual["covenant_review_status"]),
-                    key=f"{loan['loan_id']}_covenant_review",
-                )
-                field_chip("manual")
-                manual["waiver_request"] = st.selectbox(
-                    "Waiver Request", BOOLEAN_OPTIONS,
-                    index=BOOLEAN_OPTIONS.index(manual["waiver_request"]),
-                    key=f"{loan['loan_id']}_waiver_request",
-                )
+    with st.container(border=True):
+        st.markdown("###### Database-Driven Loan Data")
+        cols = st.columns(3)
+        for idx, (key, label) in enumerate(LOAN_COGNOS_FIELDS):
+            value = format_db_value(key, db[key])
+            with cols[idx % 3]:
+                render_db_value(label, value, key=f"{loan['loan_id']}_overview_{key}")
+
+    with st.container(border=True):
+        st.markdown("###### Manual Loan Inputs")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            field_chip("manual")
+            manual["loan_rate_type"] = st.selectbox(
+                "Loan Rate Type", RATE_TYPES,
+                index=RATE_TYPES.index(manual["loan_rate_type"]),
+                key=f"{loan['loan_id']}_rate_type",
+                disabled=read_only,
+            )
+            field_chip("manual")
+            manual["loan_term_years"] = st.number_input(
+                "Loan Term (Years)", min_value=1, max_value=30,
+                value=int(manual["loan_term_years"]),
+                key=f"{loan['loan_id']}_loan_term_years",
+                disabled=read_only,
+            )
             field_chip("manual")
             manual["additional_repayment_sources"] = st.selectbox(
                 "Additional Sources of Repayment",
                 ["Guarantor Support", "Deposit Collateral", "Cross-Collateral", "Operating Cash Flow", "Other"],
                 index=["Guarantor Support", "Deposit Collateral", "Cross-Collateral", "Operating Cash Flow", "Other"].index(manual["additional_repayment_sources"]),
                 key=f"{loan['loan_id']}_repayment_sources",
+                disabled=read_only,
+            )
+        with c2:
+            field_chip("manual")
+            manual["strength_bucket"] = st.selectbox(
+                "Primary Strength", ["Collateral Quality", "Guarantor Support", "Deposit Depth", "Cash Flow Stability", "Market Position"],
+                index=["Collateral Quality", "Guarantor Support", "Deposit Depth", "Cash Flow Stability", "Market Position"].index(manual["strength_bucket"]),
+                key=f"{loan['loan_id']}_strength_bucket",
+                disabled=read_only,
+            )
+            field_chip("manual")
+            manual["weakness_bucket"] = st.selectbox(
+                "Primary Weakness", ["Tenant Rollover", "Leverage", "Liquidity", "Construction Timing", "Concentration"],
+                index=["Tenant Rollover", "Leverage", "Liquidity", "Construction Timing", "Concentration"].index(manual["weakness_bucket"]),
+                key=f"{loan['loan_id']}_weakness_bucket",
+                disabled=read_only,
+            )
+            field_chip("manual")
+            manual["relationship_risk_assessment"] = st.selectbox(
+                "Relationship Risk Assessment",
+                ["Low", "Moderate", "Elevated"],
+                index=["Low", "Moderate", "Elevated"].index(manual["relationship_risk_assessment"]),
+                key=f"{loan['loan_id']}_relationship_risk",
+                disabled=read_only,
+            )
+        with c3:
+            field_chip("manual")
+            manual["risk_rating_recommendation"] = st.selectbox(
+                "Risk Rating Recommendation",
+                RISK_RATINGS,
+                index=RISK_RATINGS.index(manual["risk_rating_recommendation"]),
+                key=f"{loan['loan_id']}_risk_reco",
+                disabled=read_only,
+            )
+            field_chip("manual")
+            manual["covenant_review_status"] = st.selectbox(
+                "Covenant Review", COVENANT_OPTIONS,
+                index=COVENANT_OPTIONS.index(manual["covenant_review_status"]),
+                key=f"{loan['loan_id']}_covenant_review",
+                disabled=read_only,
+            )
+            field_chip("manual")
+            manual["waiver_request"] = st.selectbox(
+                "Waiver Request", BOOLEAN_OPTIONS,
+                index=BOOLEAN_OPTIONS.index(manual["waiver_request"]),
+                key=f"{loan['loan_id']}_waiver_request",
+                disabled=read_only,
             )
 
 
 def render_rent_roll_section(loan):
+    read_only = is_archive_view()
     st.markdown("##### Rent Roll Analysis")
-    st.caption("All rent roll fields are manual in this mockup. Add or remove rows as needed.")
+    st.caption("Archived rent roll is read-only." if read_only else "All rent roll fields are manual in this mockup. Add or remove rows as needed.")
     rr = loan["rent_roll"]
     rr_editor = st.data_editor(
         rr,
-        num_rows="dynamic",
-        use_container_width=True,
+        num_rows="fixed" if read_only else "dynamic",
+        disabled=read_only,
+        width="stretch",
         key=f"{loan['loan_id']}_rent_roll_editor",
     )
     loan["rent_roll"] = rr_editor.copy()
@@ -828,7 +992,7 @@ def render_rent_roll_section(loan):
 
     left, right = st.columns([2.2, 1.2])
     with left:
-        st.dataframe(fmt_df, use_container_width=True, hide_index=True)
+        st.dataframe(fmt_df, width="stretch", hide_index=True)
     with right:
         les = lease_expiration_summary(computed)
         # Build a display copy as object dtype so formatted strings do not clash with numeric dtypes
@@ -836,14 +1000,15 @@ def render_rent_roll_section(loan):
         for y in ["Year 1", "Year 2", "Year 3"]:
             les_fmt.loc[les_fmt["Metric"] == "total %", y] = les_fmt.loc[les_fmt["Metric"] == "total %", y].apply(lambda x: f"{float(x):.2%}")
             les_fmt.loc[les_fmt["Metric"] == "sq ft", y] = les_fmt.loc[les_fmt["Metric"] == "sq ft", y].apply(lambda x: f"{float(x):,.0f}")
+            les_fmt[y] = les_fmt[y].astype(str)
         vo = vacant_occupied_summary(computed)
         vo_fmt = vo.copy()
         vo_fmt["sq ft"] = vo_fmt["sq ft"].apply(lambda x: f"{float(x):,.0f}")
         vo_fmt["%"] = vo_fmt["%"].apply(lambda x: f"{float(x):.2%}")
         st.markdown("**Lease Expiration Summary**")
-        st.dataframe(les_fmt, use_container_width=True, hide_index=True)
+        st.dataframe(les_fmt, width="stretch", hide_index=True)
         st.markdown("**Vacancy / Occupancy Summary**")
-        st.dataframe(vo_fmt, use_container_width=True, hide_index=True)
+        st.dataframe(vo_fmt, width="stretch", hide_index=True)
     return computed, with_footer, les, vo
 
 
@@ -871,66 +1036,80 @@ def build_stress_state_from_loan(loan):
 
 
 def render_stress_section(loan):
+    read_only = is_archive_view()
     st.markdown("##### Investor CRE Stress Test")
     manual = loan["stress_manual"]
     db = loan["db"]
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        render_db_value("Current Loan Amount", money(db["current_loan_amount"]), key=f"{loan['loan_id']}_stress_current_loan_amount")
-        render_db_value("Note Rate", f"{db['note_rate']*100:.2f}%", key=f"{loan['loan_id']}_stress_note_rate")
-    with c2:
-        render_db_value("Amortization / I-O", db["amortization_period_or_io"], key=f"{loan['loan_id']}_stress_amortization")
-        render_db_value("Annual Debt Service", money(db["annual_debt_service"]), key=f"{loan['loan_id']}_stress_annual_debt_service")
-    with c3:
-        field_chip("manual")
-        manual["income_source"] = st.selectbox(
-            "Rental Income Source", SOURCE_OPTIONS,
-            index=SOURCE_OPTIONS.index(manual["income_source"]),
-            key=f"{loan['loan_id']}_income_source",
-        )
-        field_chip("manual")
-        manual["rental_income"] = st.number_input(
-            "Rental Income ($/yr)", min_value=0.0, value=float(manual["rental_income"]), step=10000.0,
-            key=f"{loan['loan_id']}_rental_income",
-        )
+    with st.container(border=True):
+        st.markdown("###### Database-Driven Stress Inputs")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            render_db_value("Current Loan Amount", money(db["current_loan_amount"]), key=f"{loan['loan_id']}_stress_current_loan_amount")
+        with c2:
+            render_db_value("Note Rate", f"{db['note_rate']*100:.2f}%", key=f"{loan['loan_id']}_stress_note_rate")
+        with c3:
+            render_db_value("Amortization / I-O", db["amortization_period_or_io"], key=f"{loan['loan_id']}_stress_amortization")
+        with c4:
+            render_db_value("Annual Debt Service", money(db["annual_debt_service"]), key=f"{loan['loan_id']}_stress_annual_debt_service")
 
-    c4, c5, c6 = st.columns(3)
-    with c4:
-        field_chip("manual")
-        manual["opex_source"] = st.selectbox(
-            "Operating Expense Source", ["Tax Return", "P&L Statement", "Appraisal", "Proforma", "Other"],
-            index=["Tax Return", "P&L Statement", "Appraisal", "Proforma", "Other"].index(manual["opex_source"]),
-            key=f"{loan['loan_id']}_opex_source",
-        )
-        field_chip("manual")
-        manual["operating_expenses"] = st.number_input(
-            "Operating Expenses ($/yr)", min_value=0.0, value=float(manual["operating_expenses"]), step=10000.0,
-            key=f"{loan['loan_id']}_operating_expenses",
-        )
-    with c5:
-        field_chip("manual")
-        manual["cap_source"] = st.selectbox(
-            "Cap Rate Source", CAP_SOURCE_OPTIONS,
-            index=CAP_SOURCE_OPTIONS.index(manual["cap_source"]),
-            key=f"{loan['loan_id']}_cap_source",
-        )
-        field_chip("manual")
-        manual["cap_rate"] = st.number_input(
-            "Cap Rate (%)", min_value=0.01, value=float(manual["cap_rate"] * 100), step=0.05,
-            key=f"{loan['loan_id']}_cap_rate",
-        ) / 100.0
-    with c6:
-        field_chip("manual")
-        manual["target_dscr"] = st.number_input(
-            "Target DSCR", min_value=0.50, value=float(manual["target_dscr"]), step=0.05,
-            key=f"{loan['loan_id']}_target_dscr",
-        )
-        field_chip("manual")
-        manual["target_ltv"] = st.number_input(
-            "Target LTV (%)", min_value=10.0, max_value=100.0, value=float(manual["target_ltv"] * 100), step=1.0,
-            key=f"{loan['loan_id']}_target_ltv",
-        ) / 100.0
+    with st.container(border=True):
+        st.markdown("###### Manual Stress Inputs")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            field_chip("manual")
+            manual["income_source"] = st.selectbox(
+                "Rental Income Source", SOURCE_OPTIONS,
+                index=SOURCE_OPTIONS.index(manual["income_source"]),
+                key=f"{loan['loan_id']}_income_source",
+                disabled=read_only,
+            )
+            field_chip("manual")
+            manual["rental_income"] = st.number_input(
+                "Rental Income ($/yr)", min_value=0.0, value=float(manual["rental_income"]), step=10000.0,
+                key=f"{loan['loan_id']}_rental_income",
+                disabled=read_only,
+            )
+        with c2:
+            field_chip("manual")
+            manual["opex_source"] = st.selectbox(
+                "Operating Expense Source", ["Tax Return", "P&L Statement", "Appraisal", "Proforma", "Other"],
+                index=["Tax Return", "P&L Statement", "Appraisal", "Proforma", "Other"].index(manual["opex_source"]),
+                key=f"{loan['loan_id']}_opex_source",
+                disabled=read_only,
+            )
+            field_chip("manual")
+            manual["operating_expenses"] = st.number_input(
+                "Operating Expenses ($/yr)", min_value=0.0, value=float(manual["operating_expenses"]), step=10000.0,
+                key=f"{loan['loan_id']}_operating_expenses",
+                disabled=read_only,
+            )
+        with c3:
+            field_chip("manual")
+            manual["cap_source"] = st.selectbox(
+                "Cap Rate Source", CAP_SOURCE_OPTIONS,
+                index=CAP_SOURCE_OPTIONS.index(manual["cap_source"]),
+                key=f"{loan['loan_id']}_cap_source",
+                disabled=read_only,
+            )
+            field_chip("manual")
+            manual["cap_rate"] = st.number_input(
+                "Cap Rate (%)", min_value=0.01, value=float(manual["cap_rate"] * 100), step=0.05,
+                key=f"{loan['loan_id']}_cap_rate",
+                disabled=read_only,
+            ) / 100.0
+            field_chip("manual")
+            manual["target_dscr"] = st.number_input(
+                "Target DSCR", min_value=0.50, value=float(manual["target_dscr"]), step=0.05,
+                key=f"{loan['loan_id']}_target_dscr",
+                disabled=read_only,
+            )
+            field_chip("manual")
+            manual["target_ltv"] = st.number_input(
+                "Target LTV (%)", min_value=10.0, max_value=100.0, value=float(manual["target_ltv"] * 100), step=1.0,
+                key=f"{loan['loan_id']}_target_ltv",
+                disabled=read_only,
+            ) / 100.0
 
     s = build_stress_state_from_loan(loan)
     noi = float(s["rental_income"] - s["operating_expenses"])
@@ -944,21 +1123,21 @@ def render_stress_section(loan):
     entry_df = pd.DataFrame(entry_rows)
     cap_df, ir_df, vac_df, noi_df = build_stress_tables(s, noi, debt_service)
 
-    st.dataframe(entry_df, use_container_width=True, hide_index=True)
+    st.dataframe(entry_df, width="stretch", hide_index=True)
 
     a, b, c, d = st.columns(4)
     with a:
         st.markdown("**Cap Rate Effect**")
-        st.dataframe(cap_df, use_container_width=True, hide_index=True)
+        st.dataframe(cap_df, width="stretch", hide_index=True)
     with b:
         st.markdown("**Interest Rate Effect**")
-        st.dataframe(ir_df, use_container_width=True, hide_index=True)
+        st.dataframe(ir_df, width="stretch", hide_index=True)
     with c:
         st.markdown("**Vacancy Rate Effect**")
-        st.dataframe(vac_df, use_container_width=True, hide_index=True)
+        st.dataframe(vac_df, width="stretch", hide_index=True)
     with d:
         st.markdown("**NOI Change Effect**")
-        st.dataframe(noi_df, use_container_width=True, hide_index=True)
+        st.dataframe(noi_df, width="stretch", hide_index=True)
 
     payload = build_stress_test_ai_payload(s, noi, debt_service, value, dscr, ltv, cap_df, ir_df, vac_df, noi_df)
     commentary = rule_based_stress_test_bullets(payload)
@@ -979,6 +1158,7 @@ def render_stress_section(loan):
 
 
 def render_rollover_section(loan, computed_rr, stress_state):
+    read_only = is_archive_view()
     st.markdown("##### Rollover Risk")
     manual = loan["rollover_manual"]
     c1, c2, c3, c4 = st.columns(4)
@@ -988,24 +1168,28 @@ def render_rollover_section(loan, computed_rr, stress_state):
             "Leasing Commission (%)", min_value=0.0, max_value=25.0,
             value=float(manual["leasing_commission_pct"] * 100), step=0.25,
             key=f"{loan['loan_id']}_lc_pct",
+            disabled=read_only,
         ) / 100.0
     with c2:
         field_chip("manual")
         manual["ti_per_sf"] = st.number_input(
             "TI ($/SF)", min_value=0.0, value=float(manual["ti_per_sf"]), step=1.0,
             key=f"{loan['loan_id']}_ti_psf",
+            disabled=read_only,
         )
     with c3:
         field_chip("manual")
         manual["market_rent_per_sf_yr"] = st.number_input(
             "Market Rent ($/SF/Yr)", min_value=0.0, value=float(manual["market_rent_per_sf_yr"]), step=1.0,
             key=f"{loan['loan_id']}_market_rent",
+            disabled=read_only,
         )
     with c4:
         field_chip("manual")
         manual["rent_loss_months"] = st.number_input(
             "Rent Loss (Months)", min_value=0.0, max_value=24.0, value=float(manual["rent_loss_months"]), step=0.5,
             key=f"{loan['loan_id']}_rent_loss_mos",
+            disabled=read_only,
         )
 
     roll_df, payload = build_rollover_risk_outputs(
@@ -1031,54 +1215,69 @@ def render_rollover_section(loan, computed_rr, stress_state):
                 disp.at[i, c] = "" if v == "" or v == "—" else fmt_money(v)
             elif row_name in dscr_rows:
                 disp.at[i, c] = "" if v == "" or v == "—" else f"{float(v):.2f}x"
-    st.dataframe(disp, use_container_width=True, hide_index=True)
+    st.dataframe(disp, width="stretch", hide_index=True)
     commentary = rule_based_rollover_bullets(payload)
     return {"table_df": roll_df, "payload": payload, "commentary": commentary}
 
 
 def render_construction_section(loan):
+    read_only = is_archive_view()
     st.markdown("##### Construction / Bridge Loan Stress Test")
     db = loan["db"]
     manual = loan["construction_manual"]
-    left, right = st.columns(2)
-    with left:
-        render_db_value("Loan Commitment", money(db["loan_commitment"]), key=f"{loan['loan_id']}_construction_loan_commitment")
-        field_chip("manual")
-        manual["proforma_noi"] = st.number_input(
-            "Pro Forma NOI ($/yr)", min_value=0.0, value=float(manual["proforma_noi"]), step=25000.0,
-            key=f"{loan['loan_id']}_proforma_noi",
-        )
-        field_chip("manual")
-        manual["appraisal_cap_rate"] = st.number_input(
-            "Appraisal Cap Rate (%)", min_value=0.01, value=float(manual["appraisal_cap_rate"] * 100), step=0.05,
-            key=f"{loan['loan_id']}_bridge_cap_rate",
-        ) / 100.0
-    with right:
-        field_chip("manual")
-        manual["takeout_amort_years"] = st.number_input(
-            "Takeout Amortization (Years)", min_value=1.0, value=float(manual["takeout_amort_years"]), step=1.0,
-            key=f"{loan['loan_id']}_takeout_amort",
-        )
-        field_chip("manual")
-        manual["takeout_dscr"] = st.number_input(
-            "Takeout DSCR", min_value=0.50, value=float(manual["takeout_dscr"]), step=0.05,
-            key=f"{loan['loan_id']}_takeout_dscr",
-        )
-        field_chip("manual")
-        manual["takeout_ltv"] = st.number_input(
-            "Takeout LTV (%)", min_value=10.0, max_value=100.0, value=float(manual["takeout_ltv"] * 100), step=1.0,
-            key=f"{loan['loan_id']}_takeout_ltv",
-        ) / 100.0
-        field_chip("manual")
-        manual["underwriting_rate"] = st.number_input(
-            "Underwriting Rate (%)", min_value=0.01, value=float(manual["underwriting_rate"] * 100), step=0.05,
-            key=f"{loan['loan_id']}_underwriting_rate",
-        ) / 100.0
 
-    manual["grid_rows"] = int(st.number_input(
-        "Rows in Stress Grids", min_value=3, max_value=10, value=int(manual["grid_rows"]), step=1,
-        key=f"{loan['loan_id']}_grid_rows",
-    ))
+    with st.container(border=True):
+        st.markdown("###### Database-Driven Construction Inputs")
+        render_db_value("Loan Commitment", money(db["loan_commitment"]), key=f"{loan['loan_id']}_construction_loan_commitment")
+
+    with st.container(border=True):
+        st.markdown("###### Manual Construction Inputs")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            field_chip("manual")
+            manual["proforma_noi"] = st.number_input(
+                "Pro Forma NOI ($/yr)", min_value=0.0, value=float(manual["proforma_noi"]), step=25000.0,
+                key=f"{loan['loan_id']}_proforma_noi",
+                disabled=read_only,
+            )
+            field_chip("manual")
+            manual["appraisal_cap_rate"] = st.number_input(
+                "Appraisal Cap Rate (%)", min_value=0.01, value=float(manual["appraisal_cap_rate"] * 100), step=0.05,
+                key=f"{loan['loan_id']}_bridge_cap_rate",
+                disabled=read_only,
+            ) / 100.0
+        with c2:
+            field_chip("manual")
+            manual["takeout_amort_years"] = st.number_input(
+                "Takeout Amortization (Years)", min_value=1.0, value=float(manual["takeout_amort_years"]), step=1.0,
+                key=f"{loan['loan_id']}_takeout_amort",
+                disabled=read_only,
+            )
+            field_chip("manual")
+            manual["takeout_dscr"] = st.number_input(
+                "Takeout DSCR", min_value=0.50, value=float(manual["takeout_dscr"]), step=0.05,
+                key=f"{loan['loan_id']}_takeout_dscr",
+                disabled=read_only,
+            )
+        with c3:
+            field_chip("manual")
+            manual["takeout_ltv"] = st.number_input(
+                "Takeout LTV (%)", min_value=10.0, max_value=100.0, value=float(manual["takeout_ltv"] * 100), step=1.0,
+                key=f"{loan['loan_id']}_takeout_ltv",
+                disabled=read_only,
+            ) / 100.0
+            field_chip("manual")
+            manual["underwriting_rate"] = st.number_input(
+                "Underwriting Rate (%)", min_value=0.01, value=float(manual["underwriting_rate"] * 100), step=0.05,
+                key=f"{loan['loan_id']}_underwriting_rate",
+                disabled=read_only,
+            ) / 100.0
+            field_chip("manual")
+            manual["grid_rows"] = int(st.number_input(
+                "Rows in Stress Grids", min_value=3, max_value=10, value=int(manual["grid_rows"]), step=1,
+                key=f"{loan['loan_id']}_grid_rows",
+                disabled=read_only,
+            ))
 
     scenarios = _noi_scenarios(float(manual["proforma_noi"]))
     cap_grid = _build_default_grid(float(manual["appraisal_cap_rate"]), 0.005, int(manual["grid_rows"]))
@@ -1120,12 +1319,12 @@ def render_construction_section(loan):
     left, right = st.columns(2)
     with left:
         st.markdown("**Cap Rate → Max Takeout (LTV Constraint)**")
-        st.dataframe(pd.DataFrame(constr_cap), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(constr_cap), width="stretch", hide_index=True)
         st.markdown("**Cap Rate → Sale Prices upon Stabilization**")
-        st.dataframe(pd.DataFrame(constr_sale), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(constr_sale), width="stretch", hide_index=True)
     with right:
         st.markdown("**Interest Rate → Max Takeout (DSCR Constraint)**")
-        st.dataframe(pd.DataFrame(constr_ir), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(constr_ir), width="stretch", hide_index=True)
 
     cap_plus_50 = float(manual["appraisal_cap_rate"]) + 0.005
     sale_cap_50 = (float(manual["proforma_noi"]) / cap_plus_50) if cap_plus_50 > 0 else 0.0
@@ -1233,9 +1432,13 @@ def validation_issues(group, loan):
 
 
 def render_final_review_and_export(group):
+    read_only = is_archive_view()
     st.divider()
     st.markdown("## Final Review and Word Export")
-    st.caption("Review each loan, edit commentary only when needed, check the loan-level review box, and export one combined relationship document.")
+    if read_only:
+        st.caption("Archived reference view. Inputs and commentary are locked; Word export remains available.")
+    else:
+        st.caption("Review each loan, edit commentary only when needed, check the loan-level review box, and export one combined relationship document.")
 
     all_issues = []
     loan_tabs = st.tabs([loan["loan_id"] for loan in group["loans"]])
@@ -1254,6 +1457,7 @@ def render_final_review_and_export(group):
         value=st.session_state[relationship_exec_key],
         height=140,
         key=f"{group['summary']['group_id']}_relationship_exec_summary_box",
+        disabled=read_only,
     )
 
     for tab, loan in zip(loan_tabs, group["loans"]):
@@ -1279,55 +1483,63 @@ def render_final_review_and_export(group):
             meta_cols[3].metric("Collateral", str(loan["db"]["collateral_type"]))
 
             render_editable_commentary_block(
-                "Primary Source of Repayment", final, "primary_repayment", loan["loan_id"], "Primary Source of Repayment", height=120
+                "Primary Source of Repayment", final, "primary_repayment", loan["loan_id"], "Primary Source of Repayment", height=120, read_only=read_only
             )
             c1, c2 = st.columns(2)
             with c1:
                 render_editable_commentary_block(
-                    "Rent Roll Commentary", final, "rent_roll_commentary", loan["loan_id"], "Rent Roll", height=220
+                    "Rent Roll Commentary", final, "rent_roll_commentary", loan["loan_id"], "Rent Roll", height=220, read_only=read_only
                 )
                 render_editable_commentary_block(
-                    "Rollover Commentary", final, "rollover_commentary", loan["loan_id"], "Rollover", height=220
+                    "Rollover Commentary", final, "rollover_commentary", loan["loan_id"], "Rollover", height=220, read_only=read_only
                 )
             with c2:
                 render_editable_commentary_block(
-                    "Stress Test Commentary", final, "stress_commentary", loan["loan_id"], "Stress Test", height=220
+                    "Stress Test Commentary", final, "stress_commentary", loan["loan_id"], "Stress Test", height=220, read_only=read_only
                 )
                 render_editable_commentary_block(
-                    "Construction Commentary", final, "construction_commentary", loan["loan_id"], "Construction", height=220
+                    "Construction Commentary", final, "construction_commentary", loan["loan_id"], "Construction", height=220, read_only=read_only
                 )
 
-            issues = validation_issues(group, loan)
-            all_issues.extend([f"{loan['loan_id']}: {issue}" for issue in issues])
-            if issues:
-                st.warning("Please complete these items before export:")
-                for issue in issues:
-                    st.write(f"- {issue}")
+            if not read_only:
+                issues = validation_issues(group, loan)
+                all_issues.extend([f"{loan['loan_id']}: {issue}" for issue in issues])
+                if issues:
+                    st.warning("Please complete these items before export:")
+                    for issue in issues:
+                        st.write(f"- {issue}")
 
-            loan["final"]["validated"] = st.checkbox(
-                "I checked rent roll, stress, rollover, construction, and commentary for this loan",
-                key=f"{loan['loan_id']}_checked_all",
-            )
+                loan["final"]["validated"] = st.checkbox(
+                    "I checked rent roll, stress, rollover, construction, and commentary for this loan",
+                    key=f"{loan['loan_id']}_checked_all",
+                )
 
     if all_issues:
         st.warning("Some loans still have missing required inputs. Please resolve them before export.")
 
     all_loan_checks = all(loan["final"].get("validated", False) for loan in group["loans"])
-    can_export = (not all_issues) and all_loan_checks
+    can_export = read_only or ((not all_issues) and all_loan_checks)
 
-    if can_export:
-        doc_path = build_relationship_word_report(group, st.session_state[relationship_exec_key])
-        with open(doc_path, "rb") as f:
-            st.download_button(
-                "Download Combined Word Document",
-                data=f,
-                file_name=f"{group['summary']['group_id']}_relationship_rbr.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                type="primary",
-                use_container_width=True,
-            )
-    else:
-        st.button("Download Combined Word Document", disabled=True, use_container_width=True)
+    export_col, archive_col = st.columns(2) if not read_only else (st.container(), None)
+    with export_col:
+        if can_export:
+            doc_path = build_relationship_word_report(group, st.session_state[relationship_exec_key])
+            with open(doc_path, "rb") as f:
+                st.download_button(
+                    "Download Combined Word Document",
+                    data=f,
+                    file_name=f"{group['summary']['group_id']}_relationship_rbr.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    type="primary",
+                    width="stretch",
+                )
+        else:
+            st.button("Download Combined Word Document", disabled=True, width="stretch")
+    if archive_col is not None:
+        with archive_col:
+            if st.button("Archive This Version", key=f"{group['summary']['group_id']}_archive_version", width="stretch"):
+                archive_path = archive_relationship_version(group, st.session_state[relationship_exec_key])
+                st.success(f"Archived {archive_path.name}")
 
 
 def compute_analysis_snapshot(loan):
@@ -1536,92 +1748,105 @@ def render_loan_workspace(loan):
 
 
 def render_mock_one(group):
-    st.markdown("## Mock 1 · Loan Tabs")
+    st.markdown("## Loan Tabs")
     tabs = st.tabs([loan["loan_id"] for loan in group["loans"]])
     for tab, loan in zip(tabs, group["loans"]):
         with tab:
             render_loan_workspace(loan)
 
 
-def open_loan_details_dialog(loan):
-    if hasattr(st, "dialog"):
-        @st.dialog(f"{loan['loan_id']} · Full Loan Details")
-        def _loan_dialog():
-            st.markdown("### Additional Fixed Data Fields")
-            rows = []
-            shown = {"borrower_name", "loan_number", "loan_type", "loan_balance", "loan_maturity_date", "current_risk_rating", "watch_reason", "collateral_type"}
-            for key, label in LOAN_COGNOS_FIELDS:
-                if key in shown:
-                    continue
-                val = loan["db"][key]
-                if isinstance(val, date):
-                    val = val.isoformat()
-                rows.append({"Field": label, "Value": val})
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        _loan_dialog()
-    else:
-        with st.expander(f"{loan['loan_id']} · Full Loan Details", expanded=True):
-            rows = [{"Field": label, "Value": loan["db"][key]} for key, label in LOAN_COGNOS_FIELDS]
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+def render_data_management():
+    st.divider()
+    with st.container(border=True):
+        st.markdown("### Archived Versions")
 
+        latest = []
+        if DATA_ARCHIVE_DIR.exists():
+            latest = sorted(DATA_ARCHIVE_DIR.glob("*.json"), reverse=True)[:12]
 
-def render_mock_two(group):
-    st.markdown("## Mock 2 · Consolidated Loan Table")
-    st.caption("Important fixed data columns stay locked. Important manual inputs stay in the table. Additional data can be opened per loan.")
-    records = []
-    for loan in group["loans"]:
-        records.append({
-            "loan_id": loan["loan_id"],
-            "borrower_name": loan["db"]["borrower_name"],
-            "loan_type": loan["db"]["loan_type"],
-            "loan_balance": loan["db"]["loan_balance"],
-            "loan_maturity_date": fmt_date(loan["db"]["loan_maturity_date"]),
-            "current_risk_rating": loan["db"]["current_risk_rating"],
-            "watch_reason": loan["db"]["watch_reason"],
-            "loan_rate_type": loan["manual"]["loan_rate_type"],
-            "loan_term_years": loan["manual"]["loan_term_years"],
-            "rental_income": loan["stress_manual"]["rental_income"],
-            "operating_expenses": loan["stress_manual"]["operating_expenses"],
-            "cap_rate_pct": loan["stress_manual"]["cap_rate"] * 100,
-            "risk_rating_recommendation": loan["manual"]["risk_rating_recommendation"],
-        })
-    df = pd.DataFrame(records)
-    edited = st.data_editor(
-        df,
-        use_container_width=True,
-        hide_index=True,
-        disabled=["loan_id", "borrower_name", "loan_type", "loan_balance", "loan_maturity_date", "current_risk_rating", "watch_reason"],
-        key=f"{group['summary']['group_id']}_summary_editor",
-        column_config={
-            "loan_balance": st.column_config.NumberColumn("Loan Balance", format="$%0.0f"),
-            "rental_income": st.column_config.NumberColumn("Rental Income", format="$%0.0f"),
-            "operating_expenses": st.column_config.NumberColumn("Operating Expenses", format="$%0.0f"),
-            "cap_rate_pct": st.column_config.NumberColumn("Cap Rate (%)", format="%.2f"),
-        },
-    )
-    for _, row in edited.iterrows():
-        loan = get_loan(group, row["loan_id"])
-        loan["manual"]["loan_rate_type"] = row["loan_rate_type"]
-        loan["manual"]["loan_term_years"] = int(row["loan_term_years"])
-        loan["stress_manual"]["rental_income"] = float(row["rental_income"])
-        loan["stress_manual"]["operating_expenses"] = float(row["operating_expenses"])
-        loan["stress_manual"]["cap_rate"] = float(row["cap_rate_pct"]) / 100.0
-        loan["manual"]["risk_rating_recommendation"] = row["risk_rating_recommendation"]
+        if latest:
+            for path in latest:
+                meta = archive_metadata(path)
+                safe_key = re.sub(r"[^A-Za-z0-9_]+", "_", path.stem)
+                c1, c2, c3, c4, c5, c6 = st.columns([1.1, 2.2, 1.2, 2.0, 0.8, 0.8])
+                c1.write(meta["group_id"])
+                c2.write(meta["group_name"])
+                c3.write(meta["archive_date"] or meta["archived_at"][:10])
+                c4.caption(meta["name"])
+                if c5.button("Open", key=f"open_archive_{safe_key}", width="stretch"):
+                    st.session_state.archive_preview_path = str(path)
+                    st.rerun()
+                if c6.button("Delete", key=f"delete_archive_{safe_key}", width="stretch"):
+                    if st.session_state.get("archive_preview_path") == str(path):
+                        st.session_state.archive_preview_path = None
+                    path.unlink(missing_ok=True)
+                    st.rerun()
+        else:
+            st.caption("No archived versions yet.")
 
-    loan_ids = [loan["loan_id"] for loan in group["loans"]]
-    selected = st.selectbox("Open detailed loan workspace", loan_ids, key=f"{group['summary']['group_id']}_detail_selector")
-    detail_loan = get_loan(group, selected)
-    open_col, _ = st.columns([1, 3])
-    with open_col:
-        if st.button("Open full loan details", key=f"{selected}_open_dialog", use_container_width=True):
-            open_loan_details_dialog(detail_loan)
-    with st.expander(f"{selected} · Detailed analysis workspace", expanded=True):
-        render_loan_workspace(detail_loan)
+        preview_path = st.session_state.get("archive_preview_path")
+        if preview_path and Path(preview_path).exists():
+            payload = read_archive_payload(preview_path)
+            group_id = payload.get("group_id", "Portfolio")
+            group_name = payload.get("group_name", "Archived portfolio snapshot")
+            st.divider()
+            st.markdown(f"#### {group_id} · {group_name}")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Archive Date", payload.get("archive_date", ""))
+            c2.metric("Archived At", payload.get("archived_at", ""))
+            c3.metric("File", Path(preview_path).name)
+            st.text_area(
+                "Relationship Executive Summary",
+                value=payload.get("relationship_exec_summary", ""),
+                height=120,
+                disabled=True,
+                key=f"archive_summary_{Path(preview_path).stem}",
+            )
+            open_col, download_col = st.columns(2)
+            with open_col:
+                if payload.get("group") and st.button("Open Archived Version in RBR", key=f"load_archive_{Path(preview_path).stem}", width="stretch"):
+                    restored_group = restore_group_from_archive_payload(payload)
+                    restored_group_id = restored_group["summary"]["group_id"]
+                    relationship_exec_key = f"{restored_group_id}_relationship_exec_summary"
+                    st.session_state[relationship_exec_key] = payload.get("relationship_exec_summary", "")
+                    st.session_state.archive_view_group = restored_group
+                    st.session_state.selected_group_id = restored_group_id
+                    st.session_state.opened_archive_label = Path(preview_path).name
+                    st.session_state.page = "RBR"
+                    st.rerun()
+                elif payload.get("portfolio") and st.button("Open Archived Portfolio", key=f"load_archive_{Path(preview_path).stem}", width="stretch"):
+                    if not st.session_state.get("archive_view_portfolio"):
+                        st.session_state.live_portfolio_before_archive = st.session_state.portfolio
+                    st.session_state.portfolio = restore_portfolio_from_archive_payload(payload)
+                    st.session_state.selected_group_id = None
+                    st.session_state.archive_view_group = None
+                    st.session_state.archive_view_portfolio = True
+                    st.session_state.opened_archive_label = Path(preview_path).name
+                    st.session_state.page = "Home"
+                    st.rerun()
+            with download_col:
+                st.download_button(
+                    "Download Archive JSON",
+                    data=Path(preview_path).read_bytes(),
+                    file_name=Path(preview_path).name,
+                    mime="application/json",
+                    key=f"download_archive_{Path(preview_path).stem}",
+                    width="stretch",
+                )
 
 
 def render_home():
     st.title(APP_TITLE)
     st.caption("Synthetic relationship data for UI mockups. Calculations and Word export are reused from the uploaded V1 app.")
+    if st.session_state.get("archive_view_portfolio"):
+        st.info(f"Viewing archived portfolio: {st.session_state.get('opened_archive_label')}")
+        if st.button("Exit Archived Portfolio", width="stretch"):
+            st.session_state.portfolio = st.session_state.get("live_portfolio_before_archive", build_demo_portfolio())
+            st.session_state.archive_view_portfolio = False
+            st.session_state.archive_view_group = None
+            st.session_state.opened_archive_label = None
+            st.session_state.selected_group_id = None
+            st.rerun()
     portfolio = st.session_state.portfolio
     rows = []
     for group in portfolio.values():
@@ -1647,22 +1872,41 @@ def render_home():
     c3.metric("Total Balances", money(df["loan balances"].sum()))
     c4.metric("Total Commitments", money(df["loan commitments"].sum()))
 
-    st.dataframe(
-        df,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "loan balances": st.column_config.NumberColumn("loan balances", format="$%0.0f"),
-            "loan commitments": st.column_config.NumberColumn("loan commitments", format="$%0.0f"),
-            "deposit balances": st.column_config.NumberColumn("deposit balances", format="$%0.0f"),
-        },
-    )
-    options = [f"{row['group #']} · {row['group name']}" for _, row in df.iterrows()]
-    selected = st.selectbox("Open client group", options, key="home_group_select")
-    if st.button("Open RBR Page", type="primary", use_container_width=True):
-        st.session_state.selected_group_id = selected.split(" · ")[0]
-        st.session_state.page = "RBR"
-        st.rerun()
+    query = st.text_input(
+        "Search by group name or group number",
+        placeholder="Type a group number or group name",
+        key="home_group_search_query",
+    ).strip()
+
+    if query:
+        mask = (
+            df["group #"].astype(str).str.contains(query, case=False, na=False, regex=False)
+            | df["group name"].astype(str).str.contains(query, case=False, na=False, regex=False)
+        )
+        filtered_df = df.loc[mask].copy()
+        if filtered_df.empty:
+            st.info("No matching groups found.")
+        else:
+            st.markdown("#### Matching Groups")
+            for _, row in filtered_df.iterrows():
+                c1, c2, c3, c4, c5 = st.columns([1.1, 2.6, 1.3, 1.3, 0.9])
+                c1.write(row["group #"])
+                c2.write(row["group name"])
+                c3.write(row["branch"])
+                c4.write(money(row["loan balances"]))
+                if c5.button("Open", key=f"open_group_{row['group #']}", type="primary", width="stretch"):
+                    st.session_state.selected_group_id = row["group #"]
+                    if st.session_state.get("archive_view_portfolio"):
+                        st.session_state.archive_view_group = portfolio[row["group #"]]
+                    else:
+                        st.session_state.opened_archive_label = None
+                        st.session_state.archive_view_group = None
+                    st.session_state.page = "RBR"
+                    st.rerun()
+    else:
+        st.caption("Start typing to search groups.")
+
+    render_data_management()
 
 
 def render_rbr_page():
@@ -1677,14 +1921,12 @@ def render_rbr_page():
             st.rerun()
     with top_right:
         st.caption("Database fields are locked. Manual fields are editable.")
+    if st.session_state.get("opened_archive_label"):
+        st.info(f"Opened archived version: {st.session_state.opened_archive_label}")
     render_group_header(group)
     render_common_sections(group)
     st.divider()
-    mock_mode = st.radio("Second-Page Mockup", ["Mock 1 · Loan Tabs", "Mock 2 · Consolidated Table"], horizontal=True)
-    if mock_mode.startswith("Mock 1"):
-        render_mock_one(group)
-    else:
-        render_mock_two(group)
+    render_mock_one(group)
     render_final_review_and_export(group)
 
 
